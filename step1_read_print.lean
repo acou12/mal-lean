@@ -22,6 +22,7 @@ def tokenize_id := tokenize_rule
     || '0' <= c && c <= '9'
     || c == '+' || c == '-' || c == '/'
     || c == '*' || c == '?' || c == '!'
+    || c == '='
 
 partial def tokenize_chars (source : List Char) : Option (List String) :=
   let tokenizers := [tokenize_punc, tokenize_id]
@@ -37,6 +38,7 @@ partial def tokenize_chars (source : List Char) : Option (List String) :=
   match source with
     | [] => some []
     | ' ' :: rest => tokenize_chars rest
+    | '\n' :: rest => tokenize_chars rest
     | cs => do
       let (token, rest_chars) ← use_tokenizers tokenizers cs
       let rest_tokens ← tokenize_chars rest_chars
@@ -204,32 +206,111 @@ end
 --                     simp only [all_no_empty_lists] at *
 --                   (list_heads a (by admit)) ++ (list_heads_iter as h)
 
-abbrev ReplEnv := List (String × (Nat → Nat → Nat))
-abbrev ReplVarEnv := List (String × Nat)
+inductive RuntimeType where
+  | nat : RuntimeType
+  | fn : RuntimeType
 
-def repl_env : ReplEnv := [
-  ("+", fun x y => x + y),
-  ("-", fun x y => x - y),
-  ("*", fun x y => x * y)
+inductive RuntimeValue where
+  | nat : Nat → RuntimeValue
+  | fn : List String → AST → RuntimeValue
+  | native_fn : String → RuntimeValue
+
+abbrev ReplEnv := List (String × RuntimeValue)
+abbrev NativeEnv := List (String × (List RuntimeValue → Option RuntimeValue))
+
+def binary_nat_native (f : Nat → Nat → Nat) : List RuntimeValue → Option RuntimeValue
+  | (.nat x) :: (.nat y) :: [] => .some $ .nat (f x y)
+  | _ => .none
+
+def fc : NativeEnv := [
+  ("+", binary_nat_native (HAdd.hAdd)),
+  ("-", binary_nat_native (HSub.hSub)),
+  ("*", binary_nat_native (HMul.hMul)),
+  ("/", binary_nat_native (HDiv.hDiv)),
+  ("%", binary_nat_native (HMod.hMod)),
+  ("==", binary_nat_native (fun x y => if x = y then 1 else 0))
 ]
+
+
+-- def Repeat (n : Nat) (t : Type) : Type := Id.run do
+--   let mut tuple := t
+--   for _ in List.range (n - 1) do
+--     tuple := t × tuple
+--   return tuple
+
+-- example : Repeat 5 Nat := (10, 3, 15, 7, 29)
+-- example : Repeat 5 Nat := (10, 3, 15, 7, 29, 2)
+
+def binary_first_class (f : Nat → Nat → Nat) : (List RuntimeValue → Option RuntimeValue)
+    | .nat x :: .nat y :: [] => some $ .nat $ f x y
+    | _ => .none
 
 def List.map_get : List (String × α) → String → Option α
   | [], _ => none
   | (x, a) :: xs, y => if x = y then some a else map_get xs y
 
-def eval_ast (ast : AST) (env : ReplEnv) (var_env : ReplVarEnv) : Option Nat :=
+partial def eval_ast (ast : AST) (env : ReplEnv) : Option RuntimeValue :=
   match ast with
-    | .atom label => match var_env.map_get label with
-      | .some val => val
-      | .none => String.toNat? label
-    | .list (.atom "let" :: .atom label :: y :: z :: []) =>
-        do eval_ast z env ((label, ←(eval_ast y env var_env)) :: var_env)
-    | .list (.atom label :: x :: y :: []) => do
-        let f ← env.map_get label
-        let x_val ← eval_ast x env var_env
-        let y_val ← eval_ast y env var_env
-        return f x_val y_val
-    | _ => none
+    | .atom label =>
+        if let .some f := env.map_get label then
+          f
+        else if let .some _ := fc.map_get label then
+          .some $ .native_fn label
+        else String.toNat? label |>.map (.nat)
+
+    | .list (.atom "fn*" :: .list params :: expr :: []) => do
+        -- the label of each atom in params, or `none` if any are not atoms
+        let param_labels ← List.foldl (fun m p_ast => match m, p_ast with
+          | .some acc, .atom label => .some (acc ++ [label])
+          | _, _ => none
+        ) (Option.some []) params
+
+        RuntimeValue.fn param_labels expr
+
+    | .list (.atom "if" :: cond_expr :: if_expr :: else_expr :: []) => do
+        let cond ← eval_ast cond_expr env
+        match cond with
+          | .nat 0 => eval_ast else_expr env
+          | _ => eval_ast if_expr env
+
+    | .list (.atom "let*" :: .atom name :: value_expr :: expr :: []) => do
+        let value ← eval_ast value_expr env
+        let new_env_item := (name, value)
+        let new_env := new_env_item :: env
+        eval_ast expr new_env
+
+    | .list (.atom "seq*" :: as) => do
+        let rec build_seq : List AST → Option AST
+          | []      => .none
+          | a :: [] => .some a
+          | a :: as => match a with
+            | .list inside_a => do
+              .some $ .list (inside_a ++ [←build_seq as])
+            | _ => none
+        eval_ast (←build_seq as) env
+
+    | .list (f_expr :: xs) => do
+        let f ← eval_ast f_expr env
+        let rec build_env (env : ReplEnv) (params : List String) (xs : List AST) : Option ReplEnv :=
+          match params, xs with
+            | p :: ps, x :: xs => do (p, ←(eval_ast x env)) :: (←(build_env env ps xs))
+            | [], [] => some env
+            | _, _ => .none -- invalid number of paramters!
+        match f with
+          | .fn params fast =>
+            eval_ast fast (← build_env env params xs)
+          | .native_fn name => do
+            let f ← fc.map_get name
+            let rec eval_all : (xs : List AST) → Option (List RuntimeValue)
+              | x :: xs => do
+                let x_eval ← eval_ast x env
+                let rest ← eval_all xs
+                return x_eval :: rest
+              | [] => .some []
+            f $ ← eval_all xs
+          | .nat _ => .none
+
+    | .list [] => .none
 
 -- #eval do
 --   let tokens ← tokenize "(+ 1 1)"
@@ -238,8 +319,11 @@ def eval_ast (ast : AST) (env : ReplEnv) (var_env : ReplVarEnv) : Option Nat :=
 --   return eval
 
 def read : String → Option AST := (do parse $ ←tokenize ·)
-def eval : AST → Option Nat := (eval_ast · repl_env [])
-def print : Nat → String := toString
+def eval : AST → Option RuntimeValue := (eval_ast · [])
+def print : RuntimeValue → String
+  | .nat n => toString n
+  | .fn params _ => s!"fn with {params}"
+  | .native_fn name => s!"native fn {name}"
 
 def rep (s : String) : Option String := do print $ ←eval $ ←read s
 
@@ -247,9 +331,12 @@ partial def main : IO Unit := do
   let stdin ← IO.getStdin
   let stdout ← IO.getStdout
 
+  -- let filePath := System.mkFilePath ["test.mal"]
+
   let rec repl : IO Unit := do
     stdout.putStr "user> "
     let inp := (←stdin.getLine).trim
+    -- let inp ← IO.FS.readFile filePath
 
     if inp != "" then
       let r := rep inp
@@ -257,3 +344,37 @@ partial def main : IO Unit := do
       repl
 
   repl
+
+
+/-
+
+ideas:
+
+(seq*
+  (let x 10)
+  (let y (* x 2))
+  (+ x y
+)
+
+==
+
+(let x 10
+(let y (* x 2)
+(+ x y)))
+
+
+(seq*
+  (f)
+  (g)
+  ...
+) == (f (g ...))
+
+infix structures:
+
+(+ 1 2) == [1 + 2]
+
+(+ (* 2 3) (* (- 4 1) 5)) == [[2 * 3] + [[4 - 1] * 5]]
+
+(cons x xs) == [x cons xs] == [x :: xs]
+
+-/

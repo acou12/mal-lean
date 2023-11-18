@@ -1,0 +1,14 @@
+(seq*
+    (let* x 10)
+    (let* y 3)
+    (let* sumTo (fn* (x)
+        (seq*
+            (let* cond (== x 0))
+            (if cond
+                0
+                (+ x (sumTo (- x 1)))
+            )
+        )
+    ))
+    (sumTo 20)
+)
