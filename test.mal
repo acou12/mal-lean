@@ -1,14 +1,22 @@
 (seq*
-    (let* x 10)
-    (let* y 3)
-    (let* sumTo (fn* (x)
-        (seq*
-            (let* cond (== x 0))
-            (if cond
-                0
-                (+ x (sumTo (- x 1)))
+    (let* ++
+        (fn* (xs ys)
+            (if (== 0 (len xs))
+                ys
+                (cons (car xs) (++ (cdr xs) ys))
+            )))
+    (let* rev
+        (fn* (xs)
+            (if (== 0 (len xs))
+                []
+                (seq*
+                    (let* first (car xs))
+                    (let* rest (cdr xs))
+                    (++ (rev rest) [first])
+                )
             )
         )
-    ))
-    (sumTo 20)
+    )
+    (let* arr (++ [1 2 3] [4 5 6]))
+    (rev arr)
 )
